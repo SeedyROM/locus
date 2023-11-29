@@ -80,6 +80,8 @@ const TemplateGenerator = struct {
     }
 
     fn processFile(self: *Self, path: []const u8) !void {
+        defer self.allocator.free(path);
+
         // Check if the file is a zig file.
         if (!isZigFile(path)) {
             std.log.debug("Skipping non-zig file: {s}\n", .{path});
@@ -139,7 +141,7 @@ const TemplateGenerator = struct {
     // -------------------------------------------------------------------------------- //
 };
 
-test "basic add functionality" {
+test "translator" {
     var translator = try init(testing.allocator, "en_US.UTF-8");
     defer translator.deinit();
     const __ = translate;
