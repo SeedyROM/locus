@@ -21,20 +21,25 @@ const TemplateGenerator = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    locale: []const u8,
     source_arena: std.heap.ArenaAllocator,
+    parse_arena: std.heap.ArenaAllocator,
+
+    locale: []const u8,
     has_errors: bool = false,
+    files_seen: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, locale: []const u8) TemplateGenerator {
         return .{
             .allocator = allocator,
             .locale = locale,
             .source_arena = std.heap.ArenaAllocator.init(allocator),
+            .parse_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *TemplateGenerator) void {
         self.source_arena.deinit();
+        self.parse_arena.deinit();
     }
 
     pub fn generate(self: *Self, root: []const u8) !void {
@@ -85,14 +90,17 @@ const TemplateGenerator = struct {
         }
 
         std.log.info("Processing file: {s}", .{path});
+        self.files_seen += 1;
 
         // Get the file contents, don't need to defer because it looks like AST parse will
         // deallocate the source.
         const source = try self.readSource(path);
 
+        // Same thing as the source arena, avoid allocations that aren't needed each file getting processed.
+        _ = self.parse_arena.reset(.retain_capacity);
         // Get the AST.
-        var ast = try std.zig.Ast.parse(self.allocator, source, .zig);
-        defer ast.deinit(self.allocator);
+        const parse_allocator = self.parse_arena.allocator();
+        var ast = try std.zig.Ast.parse(parse_allocator, source, .zig);
 
         // Print the errors if there are any.
         try printAstErrors(path, source, &ast);
@@ -140,7 +148,7 @@ const TemplateGenerator = struct {
         //
         // NOTE(SeedyROM): This won't work for multiple threads obviously.
         // ======================================================================================
-        _ = self.source_arena.reset(.retain_capacity); // NOTE(SeedyROM): How do you handle this bool?
+        _ = self.source_arena.reset(.retain_capacity);
 
         // Get the allocator.
         const allocator = self.source_arena.allocator();
@@ -194,9 +202,13 @@ test "translator" {
 }
 
 test "template generator" {
-    std.testing.log_level = .debug;
     var generator = TemplateGenerator.init(testing.allocator, "en_US.UTF-8");
     defer generator.deinit();
 
-    try generator.generate("./test/src");
+    try generator.generate("/Users/zack/Workspace/zig/zig/lib");
+
+    std.debug.print("Files seen: {d}\n", .{generator.files_seen});
+
+    // NOTE(SeedyROM): Always fail to recompile each time.
+    try testing.expect(false);
 }
