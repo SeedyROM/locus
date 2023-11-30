@@ -205,6 +205,7 @@ test "template generator" {
     var generator = TemplateGenerator.init(testing.allocator, "en_US.UTF-8");
     defer generator.deinit();
 
+    // TODO(SeedyROM): Make this a real test path, use the zig stdlib.
     try generator.generate("/Users/zack/Workspace/zig/zig/lib");
 
     std.debug.print("Files seen: {d}\n", .{generator.files_seen});
