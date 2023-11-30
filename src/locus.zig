@@ -51,7 +51,6 @@ const TemplateGenerator = struct {
                 const path = try self.pathFromRoot(root, entry.name);
                 defer self.allocator.free(path);
 
-                std.log.info("Processing file: {s}", .{path});
                 self.processFile(path) catch {
                     std.log.err("Error processing file: {s}", .{path});
                     self.has_errors = true;
@@ -84,6 +83,8 @@ const TemplateGenerator = struct {
             std.log.debug("Skipping non-zig file: {s}", .{path});
             return;
         }
+
+        std.log.info("Processing file: {s}", .{path});
 
         // Get the file contents, don't need to defer because it looks like AST parse will
         // deallocate the source.
