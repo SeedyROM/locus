@@ -22,19 +22,19 @@ const TemplateGenerator = struct {
 
     allocator: std.mem.Allocator,
     locale: []const u8,
-    file_arena: std.heap.ArenaAllocator,
+    source_arena: std.heap.ArenaAllocator,
     has_errors: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, locale: []const u8) TemplateGenerator {
         return .{
             .allocator = allocator,
             .locale = locale,
-            .file_arena = std.heap.ArenaAllocator.init(allocator),
+            .source_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *TemplateGenerator) void {
-        self.file_arena.deinit();
+        self.source_arena.deinit();
     }
 
     pub fn generate(self: *Self, root: []const u8) !void {
@@ -136,11 +136,13 @@ const TemplateGenerator = struct {
         //
         // All allocations using the arena will be written over when the arena is cleared. No defers are
         // needed.
+        //
+        // NOTE(SeedyROM): This won't work for multiple threads obviously.
         // ======================================================================================
-        _ = self.file_arena.reset(.retain_capacity); // NOTE(SeedyROM): How do you handle this bool?
+        _ = self.source_arena.reset(.retain_capacity); // NOTE(SeedyROM): How do you handle this bool?
 
         // Get the allocator.
-        const allocator = self.file_arena.allocator();
+        const allocator = self.source_arena.allocator();
 
         // Open the file.
         const file = try std.fs.cwd().openFile(path, .{});
