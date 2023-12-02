@@ -127,13 +127,18 @@ const TemplateGenerator = struct {
         try self.getTranslateStrings(&tree);
     }
 
+    // NOTES(SeedyROM):
+    // - This probably doesn't need to recurse every single node but only top level nodes.
     fn getTranslateStrings(self: *Self, tree: *std.zig.Ast) !void {
         _ = self;
         const ctx = struct {
             fn callback(_self: @This(), _tree: Ast, child_node: Ast.Node.Index) error{OutOfMemory}!void {
                 _ = _self;
                 const node = _tree.nodes.get(child_node);
-                std.debug.print("Node: {any}\n", .{node});
+                if (node.tag == .string_literal) {
+                    const string_token = _tree.tokens.get(node.main_token);
+                    std.debug.print("Found string: {any}\n", .{string_token});
+                }
             }
         };
 
