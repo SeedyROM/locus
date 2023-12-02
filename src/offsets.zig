@@ -1,0 +1,612 @@
+//
+// MIT License
+// Copyright (c) 2020 Auguste Rame and Alexandros Naskos
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+
+const std = @import("std");
+const ast = @import("ast.zig");
+const Ast = std.zig.Ast;
+
+/// Position in a text document expressed as zero-based line and character
+/// offset. Prior to 3.17 the offsets were always based on a UTF-16 string
+/// representation. So a string of the form `a𐐀b` the character offset of the
+/// character `a` is 0, the character offset of `𐐀` is 1 and the character
+/// offset of b is 3 since `𐐀` is represented using two code units in UTF-16.
+/// Since 3.17 clients and servers can agree on a different string encoding
+/// representation (e.g. UTF-8). The client announces it's supported encoding
+/// via the client capability [`general.positionEncodings`](#clientCapabilities).
+/// The value is an array of position encodings the client supports, with
+/// decreasing preference (e.g. the encoding at index `0` is the most preferred
+/// one). To stay backwards compatible the only mandatory encoding is UTF-16
+/// represented via the string `utf-16`. The server can pick one of the
+/// encodings offered by the client and signals that encoding back to the
+/// client via the initialize result's property
+/// [`capabilities.positionEncoding`](#serverCapabilities). If the string value
+/// `utf-16` is missing from the client's capability `general.positionEncodings`
+/// servers can safely assume that the client supports UTF-16. If the server
+/// omits the position encoding in its initialize result the encoding defaults
+/// to the string value `utf-16`. Implementation considerations: since the
+/// conversion from one encoding into another requires the content of the
+/// file / line the conversion is best done where the file is read which is
+/// usually on the server side.
+///
+/// Positions are line end character agnostic. So you can not specify a position
+/// that denotes `\r|\n` or `\n|` where `|` represents the character offset.
+///
+/// @since 3.17.0 - support for negotiated position encoding.
+pub const Position = struct {
+    /// Line position in a document (zero-based).
+    ///
+    /// If a line number is greater than the number of lines in a document, it defaults back to the number of lines in the document.
+    /// If a line number is negative, it defaults to 0.
+    line: u32,
+    /// Character offset on a line in a document (zero-based).
+    ///
+    /// The meaning of this offset is determined by the negotiated
+    /// `PositionEncodingKind`.
+    ///
+    /// If the character value is greater than the line length it defaults back to the
+    /// line length.
+    character: u32,
+};
+
+/// A range in a text document expressed as (zero-based) start and end positions.
+///
+/// If you want to specify a range that contains a line including the line ending
+/// character(s) then use an end position denoting the start of the next line.
+/// For example:
+/// ```ts
+/// {
+///     start: { line: 5, character: 23 }
+///     end : { line 6, character : 0 }
+/// }
+/// ```
+pub const Range = struct {
+    /// The range's start position.
+    start: Position,
+    /// The range's end position.
+    end: Position,
+};
+
+pub const Encoding = enum {
+    /// Character offsets count UTF-8 code units (e.g. bytes).
+    @"utf-8",
+    /// Character offsets count UTF-16 code units.
+    ///
+    /// This is the default and must always be supported
+    /// by servers
+    @"utf-16",
+    /// Character offsets count UTF-32 code units.
+    ///
+    /// Implementation note: these are the same as Unicode codepoints,
+    /// so this `PositionEncodingKind` may also be used for an
+    /// encoding-agnostic representation of character offsets.
+    @"utf-32",
+};
+
+pub const Loc = std.zig.Token.Loc;
+
+pub fn indexToPosition(text: []const u8, index: usize, encoding: Encoding) Position {
+    const last_line_start = if (std.mem.lastIndexOf(u8, text[0..index], "\n")) |line| line + 1 else 0;
+    const line_count = std.mem.count(u8, text[0..last_line_start], "\n");
+
+    return .{
+        .line = @intCast(line_count),
+        .character = @intCast(countCodeUnits(text[last_line_start..index], encoding)),
+    };
+}
+
+pub fn maybePositionToIndex(text: []const u8, position: Position, encoding: Encoding) ?usize {
+    var line: u32 = 0;
+    var line_start_index: usize = 0;
+    for (text, 0..) |c, i| {
+        if (line == position.line) break;
+        if (c == '\n') {
+            line += 1;
+            line_start_index = i + 1;
+        }
+    }
+
+    if (line != position.line) return null;
+
+    const line_text = std.mem.sliceTo(text[line_start_index..], '\n');
+    const line_byte_length = getNCodeUnitByteCount(line_text, position.character, encoding);
+
+    return line_start_index + line_byte_length;
+}
+
+pub fn positionToIndex(text: []const u8, position: Position, encoding: Encoding) usize {
+    var line: u32 = 0;
+    var line_start_index: usize = 0;
+    for (text, 0..) |c, i| {
+        if (line == position.line) break;
+        if (c == '\n') {
+            line += 1;
+            line_start_index = i + 1;
+        }
+    }
+    std.debug.assert(line == position.line);
+
+    const line_text = std.mem.sliceTo(text[line_start_index..], '\n');
+    const line_byte_length = getNCodeUnitByteCount(line_text, position.character, encoding);
+
+    return line_start_index + line_byte_length;
+}
+
+pub fn sourceIndexToTokenIndex(tree: Ast, source_index: usize) Ast.TokenIndex {
+    std.debug.assert(source_index < tree.source.len);
+
+    const tokens_start = tree.tokens.items(.start);
+    var upper_index = tokens_start.len - 1;
+    var mid: usize = upper_index / 2;
+
+    if (tokens_start.len < 600) {
+        const mid_tok_start = tokens_start[mid];
+        if (mid_tok_start < source_index) { // source_index is in upper half
+            const quart_index = mid + (mid / 2);
+            const quart_tok_start = tokens_start[quart_index];
+            if (quart_tok_start < source_index) { // source_index is in upper fourth
+            } else { // source_index is in upper third
+                upper_index = quart_index;
+            }
+        } else { // source_index is in lower half
+            const quart_index = mid / 2;
+            const quart_tok_start = tokens_start[quart_index];
+            if (quart_tok_start < source_index) { // source_index is in second/4
+                upper_index = mid;
+            } else { // source_index is in first/4
+                upper_index = quart_index;
+            }
+        }
+    } else {
+        // at which point to stop dividing and just iterate
+        // good results w/ 128 as well, anything lower/higher and the cost of
+        // dividing overruns the cost of iterating and vice versa
+        const threshold = 168;
+
+        var lower_index: usize = 0;
+        while (true) {
+            const mid_tok_start = tokens_start[mid];
+            if (mid_tok_start < source_index) { // source_index is in upper half
+                if ((upper_index - mid) < threshold) break;
+                lower_index = mid; // raise the lower_index to mid
+            } else { // source_index is in lower half
+                upper_index = mid; // lower the upper_index to mid
+                if ((mid - lower_index) < threshold) break;
+            }
+            mid = lower_index + (upper_index - lower_index) / 2;
+        }
+    }
+    while (upper_index > 0) : (upper_index -= 1) {
+        const token_start = tokens_start[upper_index];
+        if (token_start > source_index) continue; // checking for equality here is suboptimal
+        // Handle source_index being > than the last possible token_start (max_token_start < source_index < tree.source.len)
+        if (upper_index == tokens_start.len - 1) break;
+        // Check if source_index is within current token
+        // (`token_start - 1` to include it's loc.start source_index and avoid the equality part of the check)
+        const is_within_current_token = (source_index > (token_start - 1)) and (source_index < tokens_start[upper_index + 1]);
+        if (!is_within_current_token) upper_index += 1; // gone 1 past
+        break;
+    }
+
+    return @intCast(upper_index);
+}
+
+fn identifierIndexToLoc(tree: Ast, source_index: usize) Loc {
+    var index: usize = source_index;
+    if (tree.source[index] == '@') {
+        index += 1;
+        std.debug.assert(tree.source[index] == '\"');
+        index += 1;
+        while (true) : (index += 1) {
+            if (tree.source[index] == '\"') {
+                index += 1;
+                break;
+            }
+        }
+    } else {
+        while (true) : (index += 1) {
+            switch (tree.source[index]) {
+                'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                else => break,
+            }
+        }
+    }
+    return .{ .start = source_index, .end = index };
+}
+
+pub fn identifierIndexToNameLoc(text: [:0]const u8, source_index: usize) Loc {
+    if (text[source_index] == '@') {
+        std.debug.assert(text[source_index + 1] == '\"');
+        const start_index = source_index + 2;
+        var index: usize = start_index;
+        while (true) : (index += 1) {
+            if (text[index] == '\"') {
+                break;
+            }
+        }
+        return .{ .start = start_index, .end = index };
+    } else {
+        var index: usize = source_index;
+        while (true) : (index += 1) {
+            switch (text[index]) {
+                'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                else => break,
+            }
+        }
+        return .{ .start = source_index, .end = index };
+    }
+}
+
+pub fn identifierIndexToNameSlice(text: [:0]const u8, source_index: usize) []const u8 {
+    return locToSlice(text, identifierIndexToNameLoc(text, source_index));
+}
+
+pub fn identifierTokenToNameLoc(tree: Ast, identifier_token: Ast.TokenIndex) Loc {
+    std.debug.assert(tree.tokens.items(.tag)[identifier_token] == .identifier);
+    return identifierIndexToNameLoc(tree.source, tree.tokens.items(.start)[identifier_token]);
+}
+
+pub fn identifierTokenToNameSlice(tree: Ast, identifier_token: Ast.TokenIndex) []const u8 {
+    return locToSlice(tree.source, identifierTokenToNameLoc(tree, identifier_token));
+}
+
+pub fn tokenToIndex(tree: Ast, token_index: Ast.TokenIndex) usize {
+    return tree.tokens.items(.start)[token_index];
+}
+
+pub fn tokensToLoc(tree: Ast, first_token: Ast.TokenIndex, last_token: Ast.TokenIndex) Loc {
+    return .{ .start = tokenToIndex(tree, first_token), .end = tokenToLoc(tree, last_token).end };
+}
+
+pub fn tokenToLoc(tree: Ast, token_index: Ast.TokenIndex) Loc {
+    const token_starts = tree.tokens.items(.start);
+    const token_tags = tree.tokens.items(.tag);
+    const start = token_starts[token_index];
+    const tag = token_tags[token_index];
+
+    // Many tokens can be determined entirely by their tag.
+    if (tag == .identifier) {
+        // fast path for identifiers
+        return identifierIndexToLoc(tree, start);
+    } else if (tag.lexeme()) |lexeme| {
+        return .{
+            .start = start,
+            .end = start + lexeme.len,
+        };
+    } else if (tag == .invalid) {
+        // invalid tokens are one byte sized so we scan left and right to find the
+        // source location that contains complete code units
+        // this assumes that `tree.source` is valid utf8
+        var begin = token_index;
+        while (begin > 0 and token_tags[begin - 1] == .invalid) : (begin -= 1) {}
+
+        var end = token_index;
+        while (end < tree.tokens.len and token_tags[end] == .invalid) : (end += 1) {}
+        return .{
+            .start = token_starts[begin],
+            .end = token_starts[end],
+        };
+    }
+
+    // For some tokens, re-tokenization is needed to find the end.
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = tree.source,
+        .index = start,
+        .pending_invalid_token = null,
+    };
+
+    // Maybe combine multi-line tokens?
+    const token = tokenizer.next();
+    // A failure would indicate a corrupted tree.source
+    std.debug.assert(token.tag == tag);
+    return token.loc;
+}
+
+pub fn tokenToSlice(tree: Ast, token_index: Ast.TokenIndex) []const u8 {
+    return locToSlice(tree.source, tokenToLoc(tree, token_index));
+}
+
+pub fn tokensToSlice(tree: Ast, first_token: Ast.TokenIndex, last_token: Ast.TokenIndex) []const u8 {
+    return locToSlice(tree.source, tokensToLoc(tree, first_token, last_token));
+}
+
+pub fn tokenToPosition(tree: Ast, token_index: Ast.TokenIndex, encoding: Encoding) Position {
+    const start = tokenToIndex(tree, token_index);
+    return indexToPosition(tree.source, start, encoding);
+}
+
+pub fn tokenToRange(tree: Ast, token_index: Ast.TokenIndex, encoding: Encoding) Range {
+    const start = tokenToPosition(tree, token_index, encoding);
+    const loc = tokenToLoc(tree, token_index);
+
+    return .{
+        .start = start,
+        .end = advancePosition(tree.source, start, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn locLength(text: []const u8, loc: Loc, encoding: Encoding) usize {
+    return countCodeUnits(text[loc.start..loc.end], encoding);
+}
+
+pub fn tokenLength(tree: Ast, token_index: Ast.TokenIndex, encoding: Encoding) usize {
+    const loc = tokenToLoc(tree, token_index);
+    return locLength(tree.source, loc, encoding);
+}
+
+pub fn rangeLength(text: []const u8, range: Range, encoding: Encoding) usize {
+    const loc = rangeToLoc(text, range, encoding);
+    return locLength(text, loc, encoding);
+}
+
+pub fn tokenIndexLength(text: [:0]const u8, index: usize, encoding: Encoding) usize {
+    const loc = tokenIndexToLoc(text, index);
+    return locLength(text, loc, encoding);
+}
+
+pub fn tokenIndexToLoc(text: [:0]const u8, index: usize) Loc {
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = text,
+        .index = index,
+        .pending_invalid_token = null,
+    };
+
+    const token = tokenizer.next();
+    return .{ .start = token.loc.start, .end = token.loc.end };
+}
+
+pub fn tokenPositionToLoc(text: [:0]const u8, position: Position, encoding: Encoding) Loc {
+    const index = positionToIndex(text, position, encoding);
+    return tokenIndexToLoc(text, index);
+}
+
+pub fn tokenIndexToSlice(text: [:0]const u8, index: usize) []const u8 {
+    return locToSlice(text, tokenIndexToLoc(text, index));
+}
+
+pub fn tokenPositionToSlice(text: [:0]const u8, position: Position) []const u8 {
+    return locToSlice(text, tokenPositionToLoc(text, position));
+}
+
+pub fn tokenIndexToRange(text: [:0]const u8, index: usize, encoding: Encoding) Range {
+    const start = indexToPosition(text, index, encoding);
+    const loc = tokenIndexToLoc(text, index);
+
+    return .{
+        .start = start,
+        .end = advancePosition(text, start, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn tokenPositionToRange(text: [:0]const u8, position: Position, encoding: Encoding) Range {
+    const index = positionToIndex(text, position, encoding);
+    const loc = tokenIndexToLoc(text, index);
+
+    return .{
+        .start = position,
+        .end = advancePosition(text, position, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn locToSlice(text: []const u8, loc: Loc) []const u8 {
+    return text[loc.start..loc.end];
+}
+
+pub fn locToRange(text: []const u8, loc: Loc, encoding: Encoding) Range {
+    std.debug.assert(loc.start <= loc.end and loc.end <= text.len);
+    const start = indexToPosition(text, loc.start, encoding);
+    return .{
+        .start = start,
+        .end = advancePosition(text, start, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn rangeToSlice(text: []const u8, range: Range, encoding: Encoding) []const u8 {
+    return locToSlice(text, rangeToLoc(text, range, encoding));
+}
+
+pub fn rangeToLoc(text: []const u8, range: Range, encoding: Encoding) Loc {
+    return .{
+        .start = positionToIndex(text, range.start, encoding),
+        .end = positionToIndex(text, range.end, encoding),
+    };
+}
+
+pub fn nodeToLoc(tree: Ast, node: Ast.Node.Index) Loc {
+    return tokensToLoc(tree, tree.firstToken(node), ast.lastToken(tree, node));
+}
+
+pub fn nodeToSlice(tree: Ast, node: Ast.Node.Index) []const u8 {
+    return locToSlice(tree.source, nodeToLoc(tree, node));
+}
+
+pub fn nodeToRange(tree: Ast, node: Ast.Node.Index, encoding: Encoding) Range {
+    return locToRange(tree.source, nodeToLoc(tree, node), encoding);
+}
+
+pub fn lineLocAtIndex(text: []const u8, index: usize) Loc {
+    return .{
+        .start = if (std.mem.lastIndexOfScalar(u8, text[0..index], '\n')) |idx| idx + 1 else 0,
+        .end = std.mem.indexOfScalarPos(u8, text, index, '\n') orelse text.len,
+    };
+}
+
+pub fn lineSliceAtIndex(text: []const u8, index: usize) []const u8 {
+    return locToSlice(text, lineLocAtIndex(text, index));
+}
+
+pub fn lineLocAtPosition(text: []const u8, position: Position, encoding: Encoding) Loc {
+    return lineLocAtIndex(text, positionToIndex(text, position, encoding));
+}
+
+pub fn lineSliceAtPosition(text: []const u8, position: Position, encoding: Encoding) []const u8 {
+    return locToSlice(text, lineLocAtPosition(text, position, encoding));
+}
+
+pub fn lineLocUntilIndex(text: []const u8, index: usize) Loc {
+    return .{
+        .start = if (std.mem.lastIndexOfScalar(u8, text[0..index], '\n')) |idx| idx + 1 else 0,
+        .end = index,
+    };
+}
+
+pub fn lineSliceUntilIndex(text: []const u8, index: usize) []const u8 {
+    return locToSlice(text, lineLocUntilIndex(text, index));
+}
+
+pub fn lineLocUntilPosition(text: []const u8, position: Position, encoding: Encoding) Loc {
+    return lineLocUntilIndex(text, positionToIndex(text, position, encoding));
+}
+
+pub fn lineSliceUntilPosition(text: []const u8, position: Position, encoding: Encoding) []const u8 {
+    return locToSlice(text, lineLocUntilPosition(text, position, encoding));
+}
+
+pub fn convertPositionEncoding(text: []const u8, position: Position, from_encoding: Encoding, to_encoding: Encoding) Position {
+    if (from_encoding == to_encoding) return position;
+
+    const line_loc = lineLocUntilPosition(text, position, from_encoding);
+
+    return .{
+        .line = position.line,
+        .character = @intCast(locLength(text, line_loc, to_encoding)),
+    };
+}
+
+pub fn convertRangeEncoding(text: []const u8, range: Range, from_encoding: Encoding, to_encoding: Encoding) Range {
+    if (from_encoding == to_encoding) return range;
+    return .{
+        .start = convertPositionEncoding(text, range.start, from_encoding, to_encoding),
+        .end = convertPositionEncoding(text, range.end, from_encoding, to_encoding),
+    };
+}
+
+/// returns true if a and b intersect
+pub fn locIntersect(a: Loc, b: Loc) bool {
+    std.debug.assert(a.start <= a.end and b.start <= b.end);
+    return a.start < b.end and a.end > b.start;
+}
+
+/// returns true if a is inside b
+pub fn locInside(inner: Loc, outer: Loc) bool {
+    std.debug.assert(inner.start <= inner.end and outer.start <= outer.end);
+    return outer.start <= inner.start and inner.end <= outer.end;
+}
+
+/// returns the union of a and b
+pub fn locMerge(a: Loc, b: Loc) Loc {
+    std.debug.assert(a.start <= a.end and b.start <= b.end);
+    return .{
+        .start = @min(a.start, b.start),
+        .end = @max(a.end, b.end),
+    };
+}
+
+// Helper functions
+
+/// advance `position` which starts at `from_index` to `to_index` accounting for line breaks
+pub fn advancePosition(text: []const u8, position: Position, from_index: usize, to_index: usize, encoding: Encoding) Position {
+    var line = position.line;
+
+    for (text[from_index..to_index]) |c| {
+        if (c == '\n') {
+            line += 1;
+        }
+    }
+
+    const line_loc = lineLocUntilIndex(text, to_index);
+
+    return .{
+        .line = line,
+        .character = @intCast(locLength(text, line_loc, encoding)),
+    };
+}
+
+/// returns the number of code units in `text`
+pub fn countCodeUnits(text: []const u8, encoding: Encoding) usize {
+    switch (encoding) {
+        .@"utf-8" => return text.len,
+        .@"utf-16" => {
+            var iter: std.unicode.Utf8Iterator = .{ .bytes = text, .i = 0 };
+
+            var utf16_len: usize = 0;
+            while (iter.nextCodepoint()) |codepoint| {
+                if (codepoint < 0x10000) {
+                    utf16_len += 1;
+                } else {
+                    utf16_len += 2;
+                }
+            }
+            return utf16_len;
+        },
+        .@"utf-32" => return std.unicode.utf8CountCodepoints(text) catch unreachable,
+    }
+}
+
+/// returns the number of (utf-8 code units / bytes) that represent `n` code units in `text`
+pub fn getNCodeUnitByteCount(text: []const u8, n: usize, encoding: Encoding) usize {
+    switch (encoding) {
+        .@"utf-8" => return n,
+        .@"utf-16" => {
+            if (n == 0) return 0;
+            var iter: std.unicode.Utf8Iterator = .{ .bytes = text, .i = 0 };
+
+            var utf16_len: usize = 0;
+            while (iter.nextCodepoint()) |codepoint| {
+                if (codepoint < 0x10000) {
+                    utf16_len += 1;
+                } else {
+                    utf16_len += 2;
+                }
+                if (utf16_len >= n) break;
+            }
+            return iter.i;
+        },
+        .@"utf-32" => {
+            var i: usize = 0;
+            var count: usize = 0;
+            while (count != n) : (count += 1) {
+                i += std.unicode.utf8ByteSequenceLength(text[i]) catch unreachable;
+            }
+            return i;
+        },
+    }
+}
+
+pub fn rangeLessThan(a: Range, b: Range) bool {
+    return positionLessThan(a.start, b.start) or positionLessThan(a.end, b.end);
+}
+
+pub fn positionLessThan(a: Position, b: Position) bool {
+    if (a.line < b.line) {
+        return true;
+    }
+    if (a.line > b.line) {
+        return false;
+    }
+
+    if (a.character < b.character) {
+        return true;
+    }
+
+    return false;
+}

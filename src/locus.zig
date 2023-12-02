@@ -1,7 +1,10 @@
 //! This library aims to match the API/functionality of gettext.
 
 const std = @import("std");
+const ast = @import("ast.zig");
 const testing = std.testing;
+
+const Ast = std.zig.Ast;
 
 const Context = struct {
     allocator: std.mem.Allocator,
@@ -15,6 +18,13 @@ const Context = struct {
     }
 
     pub fn deinit(_: *Context) void {}
+};
+
+const TranslationString = struct {
+    file_name: []const u8,
+    line_number: usize,
+    column_number: usize,
+    message: []const u8,
 };
 
 const TemplateGenerator = struct {
@@ -42,7 +52,11 @@ const TemplateGenerator = struct {
         self.parse_arena.deinit();
     }
 
-    pub fn generate(self: *Self, root: []const u8) !void {
+    pub const GenerateOptions = struct {
+        ignore_parse_errors: bool = false,
+    };
+
+    pub fn generate(self: *Self, root: []const u8, opts: GenerateOptions) !void {
         std.log.debug("Processing directory: {s}", .{root});
 
         // Open the root directory.
@@ -64,12 +78,12 @@ const TemplateGenerator = struct {
                 const path = try self.pathFromRoot(root, entry.name);
                 defer self.allocator.free(path);
 
-                try self.generate(path);
+                try self.generate(path, opts);
             }
         }
 
         // Fail if there were any errors.
-        if (self.has_errors) {
+        if (!opts.ignore_parse_errors and self.has_errors) {
             return error.ParseError;
         }
     }
@@ -100,24 +114,39 @@ const TemplateGenerator = struct {
         _ = self.parse_arena.reset(.retain_capacity);
         // Get the AST.
         const parse_allocator = self.parse_arena.allocator();
-        var ast = try std.zig.Ast.parse(parse_allocator, source, .zig);
+        var tree = try std.zig.Ast.parse(parse_allocator, source, .zig);
 
         // Print the errors if there are any.
-        try printAstErrors(path, source, &ast);
+        try printAstErrors(path, source, &tree);
         // Fail if there are any errors.
-        if (ast.errors.len != 0) {
+        if (tree.errors.len != 0) {
             return error.ParseError;
         }
+
+        // Find where the translation strings are.
+        try self.getTranslateStrings(&tree);
     }
 
-    fn printAstErrors(path: []const u8, source: [:0]const u8, ast: *std.zig.Ast) !void {
-        // Make sure the ast doesn't have errors.
+    fn getTranslateStrings(self: *Self, tree: *std.zig.Ast) !void {
+        _ = self;
+        const ctx = struct {
+            fn callback(_self: @This(), _tree: Ast, child_node: Ast.Node.Index) error{OutOfMemory}!void {
+                _ = _self;
+                const node = _tree.nodes.get(child_node);
+                std.debug.print("Node: {any}\n", .{node});
+            }
+        };
+
+        try ast.iterateChildrenRecursive(tree.*, 0, ctx{}, error{OutOfMemory}, ctx.callback);
+    }
+
+    fn printAstErrors(path: []const u8, source: [:0]const u8, tree: *const std.zig.Ast) !void {
         // This is copied from the zig codebase:
         // https://github.com/ziglang/zig/blob/master/lib/std/zig/parser_test.zig#L6175C5-L6191C6
-        for (ast.errors) |parse_error| {
-            const loc = ast.tokenLocation(0, parse_error.token);
+        for (tree.errors) |parse_error| {
+            const loc = tree.tokenLocation(0, parse_error.token);
             std.debug.print("{s}:{d}:{d}: error: ", .{ path, loc.line + 1, loc.column + 1 });
-            try ast.renderError(parse_error, std.io.getStdErr().writer());
+            try tree.renderError(parse_error, std.io.getStdErr().writer());
             std.debug.print("\n{s}\n", .{source[loc.line_start..loc.line_end]});
             {
                 var i: usize = 0;
@@ -206,10 +235,7 @@ test "template generator" {
     defer generator.deinit();
 
     // TODO(SeedyROM): Make this a real test path, use the zig stdlib.
-    try generator.generate("/Users/zack/Workspace/zig/zig/lib");
+    try generator.generate("./test/src", .{ .ignore_parse_errors = true });
 
     std.debug.print("Files seen: {d}\n", .{generator.files_seen});
-
-    // NOTE(SeedyROM): Always fail to recompile each time.
-    try testing.expect(false);
 }
